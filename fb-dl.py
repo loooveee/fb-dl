@@ -162,13 +162,47 @@ def _draw_status() -> None:
     sys.stdout.flush()
 
 
+_LOG_FILE = None   # fb-dl.log of the profile being downloaded (open_log())
+
+
 def log(msg: str = "", err: bool = False) -> None:
-    """Print a log line above the status line, then redraw it."""
+    """Print a log line above the status line, then redraw it. Also written to fb-dl.log, without
+    colors and with the time."""
     with _print_lock:
         _clear_status()
         sys.stdout.flush()
         print(msg, file=sys.stderr if err else sys.stdout, flush=True)
         _draw_status()
+        if _LOG_FILE:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            try:
+                for line in _ANSI_RE.sub("", str(msg)).splitlines() or [""]:
+                    _LOG_FILE.write(f"{stamp}  {line}\n" if line.strip() else "\n")
+                _LOG_FILE.flush()
+            except (OSError, ValueError):
+                pass
+
+
+def open_log(path: Path, title: str) -> None:
+    """Append this run to `path` (fb-dl.log in the profile folder)."""
+    global _LOG_FILE
+    close_log()
+    try:
+        _LOG_FILE = open(path, "a", encoding="utf-8")
+        _LOG_FILE.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} · fb-dl {__version__} · {title} =====\n")
+    except OSError:
+        _LOG_FILE = None
+
+
+def close_log() -> None:
+    global _LOG_FILE
+    with _print_lock:
+        if _LOG_FILE:
+            try:
+                _LOG_FILE.close()
+            except OSError:
+                pass
+        _LOG_FILE = None
 
 
 def status(msg: str) -> None:
@@ -2064,11 +2098,15 @@ class Run:
     def posts_ok(self) -> int:
         return len(self.saved)
 
-    def fail(self, progress: Optional[Progress], post: dict, reason: str, files: Optional[list[str]] = None) -> None:
+    def fail(self, progress: Optional[Progress], post: dict, reason: str, files: Optional[list[str]] = None,
+             items: Optional[list[tuple[str, str, str]]] = None) -> None:
+        """A post that is not fully saved. `items`: (kind, link, detail) of each photo / video that failed."""
         if progress:
             progress.mark(post["id"], "error", files, reason)
-        self.failures.append((post["url"], reason))
-        log(f"  {bold_red('✗')} {link(post['url'])}\n      {gray('└')} {yellow(reason)}")
+        self.failures.append(failure("post", post["url"] or post["id"], reason, items))
+        lines = [f"  {bold_red('✗')} {link(post['url'] or post['id'])}", f"      {gray('└')} {yellow(reason)}"]
+        lines += [f"        {gray('·')} {kind}: {link(url)}  {gray(detail)}" for kind, url, detail in items or []]
+        log("\n".join(lines))
 
     def posts(self, pending: list[dict], progress: Progress) -> None:
         """Download a known list of posts (used for single post links)."""
@@ -2149,11 +2187,21 @@ class Run:
             self.fail(progress, post, plan["error"])
             return False
         out_dir, opts = self.out_dir, self.opts
-        reasons = [t(f"photo not downloaded: {d.name}", f"không tải được ảnh: {d.name}")
-                   for _, d in plan["photos"] if not is_valid_file(d)]
-        reasons += [t(f"video not downloaded ({video_errors.get(d, '?')})",
-                      f"không tải được video ({video_errors.get(d, '?')})")
-                    for _, d in plan["videos"] if not is_valid_file(d)]
+        # Every photo / video that failed, with a link to open it on Facebook.
+        items = [(t("photo", "ảnh"), f"{FB}/photo/?fbid={pid}", d.relative_to(out_dir).as_posix())
+                 for pid, (_, d) in zip(plan["photo_ids"], plan["photos"]) if not is_valid_file(d)]
+        items += [("reel" if is_reel(v) else "video", v.get("page") or f"{FB}/watch/?v={v['id']}",
+                   video_errors.get(d) or t("not downloaded", "không tải được"))
+                  for v, d in plan["videos"] if not is_valid_file(d)]
+        n_bad_photos = sum(1 for _, d in plan["photos"] if not is_valid_file(d))
+        n_bad_videos = len(items) - n_bad_photos
+        reasons = []
+        if n_bad_photos:
+            reasons.append(t(f"{n_bad_photos} of {len(plan['photos'])} photo{'s' if len(plan['photos']) != 1 else ''} not downloaded",
+                             f"{n_bad_photos}/{len(plan['photos'])} ảnh không tải được"))
+        if n_bad_videos:
+            reasons.append(t(f"{n_bad_videos} of {len(plan['videos'])} video{'s' if len(plan['videos']) != 1 else ''} not downloaded",
+                             f"{n_bad_videos}/{len(plan['videos'])} video không tải được"))
         files = [f for f in plan["files"] if is_valid_file(out_dir / f)]
         new_files = [f for f in files if f not in plan["had"]]
         if opts.text:
@@ -2169,7 +2217,7 @@ class Run:
             if is_valid_file(dest):
                 progress.add_photo(str(pid), dest.relative_to(out_dir).as_posix())
         if reasons:
-            self.fail(progress, post, "; ".join(reasons), files)
+            self.fail(progress, post, "; ".join(reasons), files, items)
             return False
         progress.mark(post["id"], "done" if self.complete else "partial", files)
         size = sum((out_dir / f).stat().st_size for f in files)
@@ -2273,8 +2321,9 @@ class Run:
                     linked += 1
                 else:
                     failed += 1
-                    self.failures.append((f"{FB}/photo/?fbid={pid}", t(f"photo not downloaded: {dest.relative_to(out_dir).as_posix()}",
-                                                                      f"không tải được ảnh: {dest.relative_to(out_dir).as_posix()}")))
+                    self.failures.append(failure("tab", f"{FB}/photo/?fbid={pid}",
+                                                 t(f"photo not downloaded: {dest.relative_to(out_dir).as_posix()}",
+                                                   f"không tải được ảnh: {dest.relative_to(out_dir).as_posix()}")))
         self.tab_photos_ok = linked + downloaded
         log(f"  {bold_green('✓')} " + t(f"{downloaded} photos downloaded, {linked} reused from files already saved",
                                          f"{downloaded} ảnh tải mới, {linked} ảnh dùng lại từ file đã có")
@@ -2320,7 +2369,8 @@ class Run:
                 if not ok:
                     reason = errors.get(dest) or t("not downloaded", "không tải được")
                     log(f"  {bold_red('✗')} {magenta('[story]')} {dest.name}  {yellow(reason)}")
-                    self.failures.append((f"{FB}/stories/{st.get('post_id') or st['id']}", f"story {dest.name}: {reason}"))
+                    self.failures.append(failure("story", f"{FB}/stories/{st.get('post_id') or st['id']}",
+                                                 f"{dest.name}: {reason}"))
                     continue
                 if st["created"]:
                     os.utime(dest, (st["created"], st["created"]))
@@ -2350,17 +2400,36 @@ def link_or_copy(src: Path, dest: Path) -> bool:
     return True
 
 
-def write_failed(out_dir: Path, failures: list[tuple[str, str]]) -> Path:
+def failure(kind: str, url: str, reason: str, items: Optional[list[tuple[str, str, str]]] = None) -> dict:
+    """One line of failed.txt. kind: post | story | tab. items: (kind, link, detail) of the photos /
+    videos inside a post that failed."""
+    return {"kind": kind, "url": url, "reason": reason, "items": items or []}
+
+
+def write_failed(out_dir: Path, failures: list[dict]) -> Path:
+    """failed.txt: what could not be downloaded, grouped, each with a link to open it on Facebook.
+    Rewritten after every run; removed when nothing failed."""
     failed_file = out_dir / "failed.txt"
-    if failures:
-        lines = [t(f"# {len(failures)} items were not fully downloaded - {datetime.now():%Y-%m-%d %H:%M}",
-                   f"# {len(failures)} mục chưa tải đủ - {datetime.now():%Y-%m-%d %H:%M}"),
-                 t("# Run the same command again to retry. Open each link to check it yourself.",
-                   "# Chạy lại đúng lệnh cũ để thử lại. Mở từng link để tự kiểm tra."), ""]
-        lines += [f"{url}\n    {reason}" for url, reason in failures]
-        failed_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
+    if not failures:
         failed_file.unlink(missing_ok=True)
+        return failed_file
+    lines = [t(f"# {len(failures)} items could not be downloaded ({datetime.now():%Y-%m-%d %H:%M})",
+               f"# {len(failures)} mục không tải được ({datetime.now():%Y-%m-%d %H:%M})"),
+             t("# Run the same command again to retry: finished items are skipped.",
+               "# Chạy lại đúng lệnh cũ để thử lại: những gì đã xong sẽ được bỏ qua."),
+             t("# Open a link to see the post / photo / video on Facebook.",
+               "# Mở link để xem bài / ảnh / video trên Facebook.")]
+    groups = [("post", t("Posts", "Bài đăng")), ("story", t("Stories", "Story")),
+              ("tab", t("Photos / Albums tabs", "Tab Ảnh / Album"))]
+    for kind, title in groups:
+        group = [f for f in failures if f["kind"] == kind]
+        if not group:
+            continue
+        lines += ["", f"== {title} ({len(group)}) =="]
+        for f in group:
+            lines += [f["url"], f"    {f['reason']}"]
+            lines += [f"    - {k}: {u}   ({d})" for k, u, d in f["items"]]
+    write_atomic(failed_file, "\n".join(lines) + "\n")
     return failed_file
 
 
@@ -2384,6 +2453,7 @@ def report(run: Run, out_dir: Path, rows: int, failed_file: Path, secs: float, w
     log(gray(t("  Folder: ", "  Thư mục: ")) + blue(str(out_dir)) + gray(f"  (posts.csv: {rows})"))
     if run.failures:
         log(yellow(t("  Failed items with links: ", "  Danh sách lỗi kèm link: ")) + blue(str(failed_file)))
+    log(gray(t("  Full log of this run: ", "  Nhật ký đầy đủ của lượt chạy: ")) + blue(str(out_dir / "fb-dl.log")))
 
 
 def account_ids(cookies: list[dict]) -> set[str]:
@@ -2423,6 +2493,7 @@ class Job:
     def open_output(self, folder: str) -> None:
         self.out_dir = Path(self.opts.output).resolve() / folder
         (self.out_dir / "metadata").mkdir(parents=True, exist_ok=True)
+        open_log(self.out_dir / "fb-dl.log", self.target.slug or self.target.url)
         self.progress = Progress(self.out_dir / ".progress.db")
         self.run = Run(self.out_dir, self.opts, self.aria2, self.ffmpeg, self.cookies, self.session)
 
@@ -2477,7 +2548,7 @@ class Job:
         try:
             self._on_new(post)
         except Exception as e:   # e.g. disk full: report this post, keep scrolling
-            self.run.failures.append((post.get("url") or post.get("id"), f"{type(e).__name__}: {e}"))
+            self.run.failures.append(failure("post", post.get("url") or post.get("id"), f"{type(e).__name__}: {e}"))
             log(f"  {bold_red('✗')} {link(post.get('url') or post.get('id'))}\n      {gray('└')} "
                 + yellow(f"{type(e).__name__}: {e}"))
 
@@ -2588,11 +2659,14 @@ class Job:
                 # Also when stopped or after an error: keep posts.csv / failed.txt in step with the files.
                 rows = write_csv(self.out_dir)
                 failed_file = write_failed(self.out_dir, self.run.failures)
-        if early is not None:
-            return early
-        report(self.run, self.out_dir, rows, failed_file, max(1.0, time.monotonic() - self.started),
-               bool(stories), self.n["already"])
-        return len(self.run.failures)
+        try:
+            if early is not None:
+                return early
+            report(self.run, self.out_dir, rows, failed_file, max(1.0, time.monotonic() - self.started),
+                   bool(stories), self.n["already"])
+            return len(self.run.failures)
+        finally:
+            close_log()
 
     def after_scroll(self, stories: list[dict]) -> Optional[int]:
         """What the scroll found. Returns an exit code when there is nothing left to download."""

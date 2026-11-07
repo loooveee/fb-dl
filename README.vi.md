@@ -226,7 +226,8 @@ downloads/nasa/
 ├── profile.json  tên, id, username, số người theo dõi
 ├── avatar.jpg    ảnh đại diện, kích thước gốc
 ├── cover.jpg     ảnh bìa, kích thước gốc
-└── failed.txt    chỉ có khi có thứ không tải được
+├── fb-dl.log     mọi thứ đã hiện trên màn hình, kèm giờ (mỗi lượt chạy được nối thêm vào cuối)
+└── failed.txt    chỉ có khi có thứ không tải được, kèm link
 ```
 
 Mọi file của một bài đều bắt đầu bằng cùng một tên `<ngày>_<id bài>_<đầu nội dung>`, nên dễ ghép file
@@ -264,12 +265,23 @@ fb-dl giữ đúng những gì có trên timeline: bài của chủ trang, bài 
 - **Tải tiếp:** chạy lại đúng lệnh cũ. Bài đã tải sẽ được bỏ qua.
 - **Lấy bài mới sau này:** thêm `--update`. Nó dừng cuộn ngay khi gặp những bài bạn đã có, nên chỉ
   mất khoảng một phút.
-- **Có lỗi?** Lỗi hiện trên màn hình kèm link và lý do, và được ghi vào `failed.txt`:
+- **Có lỗi?** Lỗi hiện ngay trên màn hình, và được ghi vào `failed.txt`, chia nhóm theo bài đăng, story
+  và tab Ảnh / Album. Bài chỉ tải được một phần còn có link tới **từng ảnh hoặc video bị lỗi**, để bạn mở
+  đúng ảnh / video đó trên Facebook:
   ```
+  == Bài đăng (1) ==
   https://www.facebook.com/nasa/posts/pfbid0abc...
-      không tải được video (HTTP Error 403: Forbidden)
+      1/3 ảnh không tải được; 1/1 video không tải được
+      - ảnh: https://www.facebook.com/photo/?fbid=1617540283064778   (images/2026-11-06_..._02.jpg)
+      - reel: https://www.facebook.com/reel/1056346190744779/   (HTTP Error 403: Forbidden)
+
+  == Tab Ảnh / Album (1) ==
+  https://www.facebook.com/photo/?fbid=1586261582859315
+      không tải được ảnh: photos/1586261582859315.jpg
   ```
   Chạy lại đúng lệnh cũ để thử lại. `failed.txt` tự biến mất khi mọi thứ đã ổn.
+- **Muốn xem lại lượt chạy đã làm gì?** Mở `fb-dl.log` trong thư mục của trang: nó lưu mọi thứ đã hiện
+  trên màn hình, kèm giờ, cho mọi lượt chạy. Tên tài khoản của bạn trong đó cũng được che.
 
 ## Tất cả tuỳ chọn
 

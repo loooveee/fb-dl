@@ -227,7 +227,8 @@ downloads/nasa/
 ├── profile.json  name, id, username, followers
 ├── avatar.jpg    profile picture, full size
 ├── cover.jpg     cover photo, full size
-└── failed.txt    only when something could not be downloaded
+├── fb-dl.log     everything shown on screen, with the time (each run is added at the end)
+└── failed.txt    only when something could not be downloaded, with links
 ```
 
 All files of one post start with the same name, `<date>_<post id>_<start of the text>`, so a text in
@@ -266,13 +267,23 @@ owner is tagged in, and collaboration posts. It skips ads and unrelated posts Fa
 - **Continue:** run the same command again. Posts already downloaded are skipped.
 - **Get new posts later:** add `--update`. It stops scrolling as soon as it reaches posts you already
   have, so it only takes a minute.
-- **Something failed?** It is shown on screen with the link and the reason, and listed in
-  `failed.txt`:
+- **Something failed?** It is shown on screen right away, and listed in `failed.txt`, grouped by
+  posts, stories and Photos / Albums tabs. A post that is only partly saved also gets a link to **each
+  photo or video that failed**, so you can open exactly that one on Facebook:
   ```
+  == Posts (1) ==
   https://www.facebook.com/nasa/posts/pfbid0abc...
-      video not downloaded (HTTP Error 403: Forbidden)
+      1 of 3 photos not downloaded; 1 of 1 video not downloaded
+      - photo: https://www.facebook.com/photo/?fbid=1617540283064778   (images/2026-11-06_..._02.jpg)
+      - reel: https://www.facebook.com/reel/1056346190744779/   (HTTP Error 403: Forbidden)
+
+  == Photos / Albums tabs (1) ==
+  https://www.facebook.com/photo/?fbid=1586261582859315
+      photo not downloaded: photos/1586261582859315.jpg
   ```
   Run the same command again to retry. `failed.txt` disappears once everything is fine.
+- **What happened during a run?** Open `fb-dl.log` in the profile folder: it keeps everything that was
+  shown on screen, with the time, for every run. Your account name is masked there too.
 
 ## All options
 

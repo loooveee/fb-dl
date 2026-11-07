@@ -9,4 +9,5 @@ cookies*.txt
 cookies*.json
 # Run state, in case someone downloads into this folder with -o .
 .progress.db
+fb-dl.log
 .parts/
