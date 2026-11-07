@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+downloads/
+aria2c.exe
+ffmpeg.exe
+# Login session and cookie exports: they work like your password
+fb-session.json
+cookies*.txt
+cookies*.json
+# Run state, in case someone downloads into this folder with -o .
+.progress.db
+.parts/
