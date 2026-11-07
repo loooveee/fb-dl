@@ -266,7 +266,8 @@ owner is tagged in, and collaboration posts. It skips ads and unrelated posts Fa
 - **Stop anytime** with `Ctrl+C`.
 - **Continue:** run the same command again. Posts already downloaded are skipped.
 - **Get new posts later:** add `--update`. It stops scrolling as soon as it reaches posts you already
-  have, so it only takes a minute.
+  have and skips the Photos / Albums tabs, so it only takes a minute. Run once in a while without
+  `--update` to refresh the tabs too.
 - **Something failed?** It is shown on screen right away, and listed in `failed.txt`, grouped by
   posts, stories and Photos / Albums tabs. A post that is only partly saved also gets a link to **each
   photo or video that failed**, so you can open exactly that one on Facebook:
@@ -296,7 +297,7 @@ Run `python fb-dl.py -h` to see them in your terminal.
 | `-n`, `--limit N` | Only the N newest posts (and the first N photos of the Photos tab and of each album) |
 | `--since YYYY-MM-DD` | Only posts from this day on (scrolling stops there). Not applied to the Photos / Albums tabs |
 | `--until YYYY-MM-DD` | Only posts up to this day. Not applied to the Photos / Albums tabs |
-| `--update` | Stop scrolling after 10 posts in a row that you already have |
+| `--update` | Stop scrolling after 10 posts in a row that you already have, and skip the Photos / Albums tabs |
 | `--no-photos` | No photos at all (also no Photos / Albums tabs, avatar or cover) |
 | `--no-videos` | No videos or reels |
 | `--no-text` | No `.txt` files |

@@ -263,8 +263,8 @@ fb-dl giữ đúng những gì có trên timeline: bài của chủ trang, bài 
 
 - **Dừng bất cứ lúc nào** bằng `Ctrl+C`.
 - **Tải tiếp:** chạy lại đúng lệnh cũ. Bài đã tải sẽ được bỏ qua.
-- **Lấy bài mới sau này:** thêm `--update`. Nó dừng cuộn ngay khi gặp những bài bạn đã có, nên chỉ
-  mất khoảng một phút.
+- **Lấy bài mới sau này:** thêm `--update`. Nó dừng cuộn ngay khi gặp những bài bạn đã có và bỏ qua tab
+  Ảnh / Album, nên chỉ mất khoảng một phút. Thỉnh thoảng chạy không có `--update` để cập nhật cả các tab.
 - **Có lỗi?** Lỗi hiện ngay trên màn hình, và được ghi vào `failed.txt`, chia nhóm theo bài đăng, story
   và tab Ảnh / Album. Bài chỉ tải được một phần còn có link tới **từng ảnh hoặc video bị lỗi**, để bạn mở
   đúng ảnh / video đó trên Facebook:
@@ -294,7 +294,7 @@ Chạy `python fb-dl.py -h` để xem ngay trong cửa sổ lệnh.
 | `-n`, `--limit N` | Chỉ N bài mới nhất (và N ảnh đầu của tab Ảnh và của mỗi album) |
 | `--since YYYY-MM-DD` | Chỉ bài từ ngày này trở đi (dừng cuộn khi tới đó). Không áp dụng cho tab Ảnh / Album |
 | `--until YYYY-MM-DD` | Chỉ bài tới hết ngày này. Không áp dụng cho tab Ảnh / Album |
-| `--update` | Dừng cuộn khi gặp 10 bài liên tiếp bạn đã có |
+| `--update` | Dừng cuộn khi gặp 10 bài liên tiếp bạn đã có, và bỏ qua tab Ảnh / Album |
 | `--no-photos` | Không tải ảnh nào (cũng bỏ tab Ảnh / Album, avatar và ảnh bìa) |
 | `--no-videos` | Không tải video và reel |
 | `--no-text` | Không ghi file `.txt` |

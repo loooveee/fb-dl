@@ -36,6 +36,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -163,6 +164,7 @@ def _draw_status() -> None:
 
 
 _LOG_FILE = None   # fb-dl.log of the profile being downloaded (open_log())
+_STOP = threading.Event()   # Ctrl+C was pressed (set by on_ctrl_c())
 
 
 def log(msg: str = "", err: bool = False) -> None:
@@ -183,15 +185,23 @@ def log(msg: str = "", err: bool = False) -> None:
                 pass
 
 
+def on_ctrl_c(signum, frame) -> None:
+    """Remember the stop, then stop as Python normally does. Playwright can turn the interrupt into
+    an error of its own; _STOP still tells the rest of fb-dl that this was a stop."""
+    _STOP.set()
+    raise KeyboardInterrupt
+
+
 def open_log(path: Path, title: str) -> None:
     """Append this run to `path` (fb-dl.log in the profile folder)."""
     global _LOG_FILE
     close_log()
-    try:
-        _LOG_FILE = open(path, "a", encoding="utf-8")
-        _LOG_FILE.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} · fb-dl {__version__} · {title} =====\n")
-    except OSError:
-        _LOG_FILE = None
+    with _print_lock:
+        try:
+            _LOG_FILE = open(path, "a", encoding="utf-8")
+            _LOG_FILE.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} · fb-dl {__version__} · {title} =====\n")
+        except OSError:
+            _LOG_FILE = None
 
 
 def close_log() -> None:
@@ -226,11 +236,17 @@ def fmt_eta(seconds: Optional[float]) -> str:
 
 
 def fmt_bytes(n: float) -> str:
+    unit = "B"
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+            break
         n /= 1024
-    return f"{n:.1f} GB"
+    return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+
+
+def count_of(n: int, one: str, many: str) -> str:
+    """'1 photo' / '2 photos' (English; Vietnamese has no plural)."""
+    return f"{n} {one if n == 1 else many}"
 
 
 def fmt_int(v) -> str:
@@ -884,8 +900,8 @@ def all_dicts(obj) -> Iterator[dict]:
 
 def grids(obj, want: Callable[[dict], bool]) -> Iterator[tuple[dict, list[dict]]]:
     """(connection, nodes) for every list of "edges" whose nodes match `want` (a photo grid, an album
-    list). Only the grid itself is used: the profile header next to it (avatar, cover) and other lists
-    on the page (comments...) are not."""
+    list). Photos outside such lists (the avatar and cover in the profile header) and lists of other
+    things (comments...) are not used; TabReader.take(main_only=True) also skips small side lists."""
     for conn in all_dicts(obj):
         edges = conn.get("edges")
         if not isinstance(edges, list):
@@ -902,10 +918,22 @@ def grids(obj, want: Callable[[dict], bool]) -> Iterator[tuple[dict, list[dict]]
 
 
 def write_atomic(path: Path, text: str, encoding: str = "utf-8") -> None:
-    """Write through a temporary file, so a stop in the middle never leaves half a file."""
+    """Write through a temporary file, so a stop in the middle never leaves half a file.
+    A file locked for a moment (antivirus, a preview) is retried; the temporary file never stays."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding=encoding, newline="")
-    os.replace(tmp, path)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.3 * (attempt + 1))
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
 
 
 def best_image(media: dict) -> tuple[Optional[str], int]:
@@ -1262,21 +1290,28 @@ class Timeline:
                 if single:
                     page.wait_for_timeout(2000)
                     return
-                if opts.stories and self.owner_id:
+                if opts.stories and self.owner_id and not opts.metadata_only:
                     self._stories(ctx)
                 self._scroll(page, should_stop)
-                if opts.all_photos and opts.photos and not opts.metadata_only and self.owner_id:
+                # --update is meant to be quick: the tabs are only read on a full run.
+                if opts.all_photos and opts.photos and not opts.metadata_only and not opts.update and self.owner_id:
                     self._tabs(ctx)
             finally:
-                browser.close()
+                try:
+                    browser.close()
+                except Exception:   # the browser may already be gone (Ctrl+C)
+                    pass
 
-    def main_post(self, url: str) -> Optional[dict]:
-        """The post a post link points to (not the suggested posts shown under it)."""
+    def main_post(self, url: str, guess: bool = True) -> Optional[dict]:
+        """The post a post link points to (not the suggested posts shown under it). Without a post
+        that matches the link, `guess` takes the first post of the page."""
         paths = {urlparse(u).path.rstrip("/") for u in (url, self.final_url) if u}
         for post in self.posts.values():
             if post["id"] in url or post["id"] in self.final_url \
                     or urlparse(post["url"] or "").path.rstrip("/") in paths:
                 return post
+        if not guess:
+            return None
         for pid in self.html_ids:
             return self.posts[pid]
         return next(iter(self.posts.values()), None)
@@ -1355,8 +1390,7 @@ class Timeline:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2500)
             self._check_page(page)
-            for blob in html_json(page.content()):
-                reader.take(blob)
+            reader.take(list(html_json(page.content())), main_only=True)
 
             def report(n: int) -> None:
                 if self.on_tab:
@@ -1459,12 +1493,17 @@ class TabReader:
         except Exception:   # an odd response: the scroll goes on
             pass
 
-    def take(self, obj) -> None:
+    def take(self, obj, main_only: bool = False) -> None:
+        """Photos / albums of the grids in `obj`. `main_only` (the page HTML, which can also hold small
+        side lists such as featured photos): only the biggest grid."""
         if self.kind == "albums":
             want = (lambda d: isinstance(d.get("title"), dict) and "/media/set/" in str(d.get("url") or ""))
         else:
             want = (lambda d: d.get("__typename") == "Photo" and bool(d.get("id")))
-        for conn, nodes in grids(obj, want):
+        found = list(grids(obj, want))
+        if main_only and found:
+            found = [max(found, key=lambda g: len(g[1]))]
+        for conn, nodes in found:
             for node in nodes:
                 if self.kind == "albums":
                     if all(a["url"] != node["url"] for a in self.albums):
@@ -2059,16 +2098,18 @@ def video_id(url: str) -> Optional[str]:
 
 def single_post(timeline: Timeline, target: Target) -> list[dict]:
     """The post a post / reel / video link points to (not the suggested posts shown under it)."""
-    post = timeline.main_post(target.url)
+    post = timeline.main_post(target.url, guess=False)
     if post:
         return [post]
     vid = video_id(timeline.final_url) or video_id(target.url)
     if vid:
-        # Reels / videos opened directly have no feed story: let yt-dlp take the link.
+        # Reels / videos opened directly have no feed story: let yt-dlp take the link (a post shown
+        # under the reel is a suggestion, not this reel).
         page = timeline.final_url if video_id(timeline.final_url) else target.url
         return [blank_post(id=vid, url=page, videos=[{"id": vid, "page": page, "direct": [],
                                                       "reel": "/reel/" in page}])]
-    return []
+    post = timeline.main_post(target.url)
+    return [post] if post else []
 
 
 class Run:
@@ -2086,7 +2127,7 @@ class Run:
         self.viewer = PhotoViewer(session, opts.wait) if opts.full_photos else None
         # A post is "done" only when nothing was turned off; else "partial" so a full run completes it.
         self.complete = opts.photos and opts.videos and opts.text and opts.full_photos
-        self.failures: list[tuple[str, str]] = []
+        self.failures = Failures()
         self.saved: set[str] = set()     # posts saved in this run (a post can be processed twice)
         self.processed: set[str] = set()
         self.stories_ok = 0
@@ -2103,7 +2144,8 @@ class Run:
         """A post that is not fully saved. `items`: (kind, link, detail) of each photo / video that failed."""
         if progress:
             progress.mark(post["id"], "error", files, reason)
-        self.failures.append(failure("post", post["url"] or post["id"], reason, items))
+        self.failures.add(failure("post", post["url"] or post["id"], reason, items))
+        self.saved.discard(post["id"])
         lines = [f"  {bold_red('✗')} {link(post['url'] or post['id'])}", f"      {gray('└')} {yellow(reason)}"]
         lines += [f"        {gray('·')} {kind}: {link(url)}  {gray(detail)}" for kind, url, detail in items or []]
         log("\n".join(lines))
@@ -2137,10 +2179,14 @@ class Run:
                 batch.append(item)
             if self.stop.is_set():
                 break
+            posts = [latest(pid) for pid in dict.fromkeys(batch)]
             try:
-                self.process([latest(pid) for pid in dict.fromkeys(batch)], progress, bar)
-            except Exception as e:   # keep going with the next batch
-                log(warn(f"{type(e).__name__}: {e}"))
+                self.process(posts, progress, bar)
+            except Exception as e:   # keep going with the next batch; report its posts
+                for post in posts:
+                    if post["id"] not in self.saved:
+                        self.fail(progress, post, f"{type(e).__name__}: {e}")
+                        bar.post_done(False)
 
     def process(self, batch: list[dict], progress: Progress, bar: ProgressBar) -> None:
         """Plan, download and check one batch of posts."""
@@ -2222,12 +2268,14 @@ class Run:
         progress.mark(post["id"], "done" if self.complete else "partial", files)
         size = sum((out_dir / f).stat().st_size for f in files)
         self.saved.add(post["id"])
+        self.failures.resolve("post", post["url"] or post["id"])   # a retry that worked
         self.bytes += sum((out_dir / f).stat().st_size for f in new_files)
         n_photos = len(plan["photos"])
         n_reels = sum(1 for v, _ in plan["videos"] if is_reel(v))
         n_videos = len(plan["videos"]) - n_reels
-        kinds = ([f"{n_photos} {t('photos', 'ảnh')}" if n_photos > 1 else t("1 photo", "1 ảnh")] if n_photos else []) \
-            + ([f"{n_videos} video"] if n_videos else []) + ([f"{n_reels} reel"] if n_reels else [])
+        kinds = ([t(count_of(n_photos, "photo", "photos"), f"{n_photos} ảnh")] if n_photos else []) \
+            + ([t(count_of(n_videos, "video", "videos"), f"{n_videos} video")] if n_videos else []) \
+            + ([t(count_of(n_reels, "reel", "reels"), f"{n_reels} reel")] if n_reels else [])
         note = ""
         if opts.photos and post["photo_count"] > n_photos:
             # Not an error: the count can include videos, and --fast-photos skips big albums.
@@ -2261,7 +2309,9 @@ class Run:
         wanted: dict[Path, str] = {}
         for pid in list(tab_photos)[:limit or None]:
             wanted.setdefault(out_dir / "photos" / f"{pid}{image_ext(tab_photos[pid]['url'])}", pid)
-        names = [sanitize(a["title"], 70) or "album" for a in albums]
+        # <out_dir>\albums\<name>\<photo id>.jpeg.aria2 must stay under Windows' 260 characters.
+        room = max(10, min(70, 259 - utf16_len(str(out_dir)) - len("\\albums\\") - 1 - 20 - len(".jpeg.aria2")))
+        names = [sanitize(a["title"], room) or "album" for a in albums]
         for album, name in zip(albums, names):
             if names.count(name) > 1:   # two albums with the same title get their own folders
                 name = f"{name} ({album.get('id') or albums.index(album) + 1})"
@@ -2271,7 +2321,8 @@ class Run:
         todo = [(pid, dest) for dest, pid in wanted.items() if not is_valid_file(dest)]
         if not todo:
             return
-        log("\n" + bold_cyan(t(f"  ── Photos / Albums tabs ({len(tab_photos)} photos, {len(albums)} albums)",
+        log("\n" + bold_cyan(t(f"  ── Photos / Albums tabs ({count_of(len(tab_photos), 'photo', 'photos')}, "
+                                f"{count_of(len(albums), 'album', 'albums')})",
                                 f"  ── Tab Ảnh / Album ({len(tab_photos)} ảnh, {len(albums)} album)")))
         linked = downloaded = failed = 0
         with ProgressBar(len(todo), unit=("photos", "ảnh")) as bar:
@@ -2321,11 +2372,12 @@ class Run:
                     linked += 1
                 else:
                     failed += 1
-                    self.failures.append(failure("tab", f"{FB}/photo/?fbid={pid}",
+                    self.failures.add(failure("tab", f"{FB}/photo/?fbid={pid}",
                                                  t(f"photo not downloaded: {dest.relative_to(out_dir).as_posix()}",
                                                    f"không tải được ảnh: {dest.relative_to(out_dir).as_posix()}")))
         self.tab_photos_ok = linked + downloaded
-        log(f"  {bold_green('✓')} " + t(f"{downloaded} photos downloaded, {linked} reused from files already saved",
+        log(f"  {bold_green('✓')} " + t(f"{count_of(downloaded, 'photo', 'photos')} downloaded, "
+                                         f"{linked} reused from files already saved",
                                          f"{downloaded} ảnh tải mới, {linked} ảnh dùng lại từ file đã có")
             + (f"   {bold_red('✗')} {failed}" if failed else ""))
 
@@ -2369,7 +2421,7 @@ class Run:
                 if not ok:
                     reason = errors.get(dest) or t("not downloaded", "không tải được")
                     log(f"  {bold_red('✗')} {magenta('[story]')} {dest.name}  {yellow(reason)}")
-                    self.failures.append(failure("story", f"{FB}/stories/{st.get('post_id') or st['id']}",
+                    self.failures.add(failure("story", f"{FB}/stories/{st.get('post_id') or st['id']}",
                                                  f"{dest.name}: {reason}"))
                     continue
                 if st["created"]:
@@ -2400,20 +2452,33 @@ def link_or_copy(src: Path, dest: Path) -> bool:
     return True
 
 
+class Failures(dict):
+    """failed.txt entries by (kind, link): an item that fails twice is listed once, and an item that
+    succeeds on a retry is taken off the list."""
+
+    def add(self, rec: dict) -> None:
+        self[(rec["kind"], rec["url"])] = rec
+
+    def resolve(self, kind: str, url: str) -> None:
+        """The item worked after all (a retry): take it off the list."""
+        self.pop((kind, url), None)
+
+
 def failure(kind: str, url: str, reason: str, items: Optional[list[tuple[str, str, str]]] = None) -> dict:
     """One line of failed.txt. kind: post | story | tab. items: (kind, link, detail) of the photos /
     videos inside a post that failed."""
     return {"kind": kind, "url": url, "reason": reason, "items": items or []}
 
 
-def write_failed(out_dir: Path, failures: list[dict]) -> Path:
+def write_failed(out_dir: Path, failures) -> Path:
     """failed.txt: what could not be downloaded, grouped, each with a link to open it on Facebook.
     Rewritten after every run; removed when nothing failed."""
     failed_file = out_dir / "failed.txt"
+    failures = list(failures.values()) if isinstance(failures, dict) else list(failures)
     if not failures:
         failed_file.unlink(missing_ok=True)
         return failed_file
-    lines = [t(f"# {len(failures)} items could not be downloaded ({datetime.now():%Y-%m-%d %H:%M})",
+    lines = [t(f"# {count_of(len(failures), 'item', 'items')} could not be downloaded ({datetime.now():%Y-%m-%d %H:%M})",
                f"# {len(failures)} mục không tải được ({datetime.now():%Y-%m-%d %H:%M})"),
              t("# Run the same command again to retry: finished items are skipped.",
                "# Chạy lại đúng lệnh cũ để thử lại: những gì đã xong sẽ được bỏ qua."),
@@ -2442,7 +2507,8 @@ def report(run: Run, out_dir: Path, rows: int, failed_file: Path, secs: float, w
     if with_stories:
         done.append(t(f"{n_stories} story file" + ("" if n_stories == 1 else "s"), f"{n_stories} file story"))
     if n_tabs:
-        done.append(t(f"{n_tabs} photos from the Photos / Albums tabs", f"{n_tabs} ảnh từ tab Ảnh / Album"))
+        done.append(t(f"{count_of(n_tabs, 'photo', 'photos')} from the Photos / Albums tabs",
+                      f"{n_tabs} ảnh từ tab Ảnh / Album"))
     counts = (f"  {bold_green('✓ ' + ', '.join(done))}   "
               + (bold_red(f"✗ {len(run.failures)}") if run.failures else gray("✗ 0")) + f" {t('failed', 'lỗi')}")
     if already:
@@ -2548,7 +2614,7 @@ class Job:
         try:
             self._on_new(post)
         except Exception as e:   # e.g. disk full: report this post, keep scrolling
-            self.run.failures.append(failure("post", post.get("url") or post.get("id"), f"{type(e).__name__}: {e}"))
+            self.run.failures.add(failure("post", post.get("url") or post.get("id"), f"{type(e).__name__}: {e}"))
             log(f"  {bold_red('✗')} {link(post.get('url') or post.get('id'))}\n      {gray('└')} "
                 + yellow(f"{type(e).__name__}: {e}"))
 
@@ -2590,6 +2656,8 @@ class Job:
         if pid in self.run.processed:
             self.run.processed.discard(pid)
             self.queue.put(pid)
+            if self.bar:
+                self.bar.found(1)
 
     def should_stop(self) -> bool:
         opts = self.opts
@@ -2613,6 +2681,21 @@ class Job:
             self.bar = None
 
     def execute(self) -> int:
+        try:
+            return self._execute()
+        finally:
+            close_log()   # always, so the next profile never writes into this profile's log
+
+    def _cleanup(self, what: str, fn: Callable):
+        """One cleanup step after a run: a failure is reported but does not hide the real result."""
+        try:
+            return fn()
+        except OSError as e:
+            log(warn(t(f"could not write {what} ({e}). Is it open in another program, such as Excel?",
+                       f"không ghi được {what} ({e}). File có đang mở trong chương trình khác như Excel?")))
+            return None
+
+    def _execute(self) -> int:
         tl, opts, target = self.timeline, self.opts, self.target
         tl.on_ready, tl.on_new, tl.on_update = self.on_ready, self.on_new, self.on_update
         stories: list[dict] = []
@@ -2636,8 +2719,9 @@ class Job:
                         self.run.stories(stories)
                     if tl.tab_photos or tl.albums:
                         self.run.tabs(tl.tab_photos, tl.albums, self.progress)
-        except KeyboardInterrupt:
-            stopped = True
+        except BaseException as e:
+            # Ctrl+C, even when Playwright turned it into an error of its own.
+            stopped = isinstance(e, KeyboardInterrupt) or _STOP.is_set()
             raise
         finally:
             if stopped:
@@ -2652,21 +2736,18 @@ class Job:
                 self.finish_downloads()   # also after an error: finish what was already queued
             if self.progress and not (self.worker and self.worker.is_alive()):
                 self.progress.close()
-            rows, failed_file = 0, None
+            rows, failed_file = 0, self.out_dir / "failed.txt" if self.out_dir else None
             if self.run:
-                if self.run.work.exists():
-                    shutil.rmtree(self.run.work, ignore_errors=True)
+                shutil.rmtree(self.run.work, ignore_errors=True)
                 # Also when stopped or after an error: keep posts.csv / failed.txt in step with the files.
-                rows = write_csv(self.out_dir)
-                failed_file = write_failed(self.out_dir, self.run.failures)
-        try:
-            if early is not None:
-                return early
-            report(self.run, self.out_dir, rows, failed_file, max(1.0, time.monotonic() - self.started),
-                   bool(stories), self.n["already"])
-            return len(self.run.failures)
-        finally:
-            close_log()
+                rows = self._cleanup("posts.csv", lambda: write_csv(self.out_dir)) or 0
+                failed_file = self._cleanup("failed.txt", lambda: write_failed(self.out_dir, self.run.failures)) \
+                    or failed_file
+        if early is not None:
+            return early
+        report(self.run, self.out_dir, rows, failed_file, max(1.0, time.monotonic() - self.started),
+               bool(stories), self.n["already"])
+        return len(self.run.failures)
 
     def after_scroll(self, stories: list[dict]) -> Optional[int]:
         """What the scroll found. Returns an exit code when there is nothing left to download."""
@@ -2678,7 +2759,10 @@ class Job:
                        "into the timeline (keep them with --include-others).",
                        f"  Bỏ qua {self.n['others']} bài quảng cáo / bài của trang khác Facebook chèn "
                        "vào timeline (giữ lại bằng --include-others).")))
-        if opts.stories:
+        if opts.update and opts.all_photos:
+            log(gray(t("  Photos / Albums tabs skipped with --update (run without it to refresh them).",
+                       "  Bỏ qua tab Ảnh / Album khi dùng --update (chạy không có --update để cập nhật chúng).")))
+        if opts.stories and not opts.metadata_only:
             log(gray(t(f"  Stories: {len(stories)} active." if stories else "  Stories: none active right now.",
                        f"  Story: {len(stories)} đang hoạt động." if stories else "  Story: hiện không có story nào.")))
         tabs = self.timeline.tab_photos or self.timeline.albums
@@ -2692,7 +2776,8 @@ class Job:
         if not self.n["own"] and not stories and not tabs:
             return 0
         if opts.metadata_only:
-            rows = write_csv(self.out_dir)
+            # posts.csv itself is written once, when the run ends (_execute's finally).
+            rows = sum(1 for _ in (self.out_dir / "metadata").glob("*.json"))
             log(green(t(f"  ✓ Metadata saved ({rows} posts in posts.csv) → ",
                         f"  ✓ Đã lưu metadata ({rows} bài trong posts.csv) → ")) + blue(str(self.out_dir)))
             return 0
@@ -2802,8 +2887,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--until", type=lambda s: parse_date(s, end=True), metavar="YYYY-MM-DD",
                    help=t("only posts up to this day", "chỉ lấy bài tới hết ngày này"))
     g.add_argument("--update", action="store_true",
-                   help=t("stop scrolling after 10 posts in a row that were already downloaded (fast re-runs)",
-                          "dừng cuộn khi gặp 10 bài liên tiếp đã tải (chạy lại nhanh để lấy bài mới)"))
+                   help=t("stop scrolling after 10 posts in a row that were already downloaded, skip the Photos / Albums tabs (fast re-runs)",
+                          "dừng cuộn khi gặp 10 bài liên tiếp đã tải, bỏ qua tab Ảnh / Album (chạy lại nhanh để lấy bài mới)"))
     g.add_argument("--no-photos", dest="photos", action="store_false", help=t("do not download photos", "không tải ảnh"))
     g.add_argument("--no-videos", dest="videos", action="store_false", help=t("do not download videos and reels", "không tải video và reel"))
     g.add_argument("--no-text", dest="text", action="store_false",
@@ -2909,6 +2994,7 @@ def main() -> None:
         log(gray(t("Login:      ", "Đăng nhập:  ")) + (green(t("yes", "có")) + gray(f"  ({Path(opts.cookies).name if opts.cookies else SESSION_FILE.name})")
             if cookies else yellow(t("no (only a few posts are visible)", "không (chỉ thấy được vài bài)"))))
 
+        signal.signal(signal.SIGINT, on_ctrl_c)
         failed = 0
         for target in opts.targets:
             try:
@@ -2918,6 +3004,8 @@ def main() -> None:
                 status("")
                 log(bold_red(t("Error: ", "Lỗi: ")) + red(str(e)), err=True)
             except Exception as e:   # an unexpected error: report it and go on with the next profile
+                if _STOP.is_set():   # it was a Ctrl+C in disguise
+                    raise KeyboardInterrupt from e
                 failed += 1
                 status("")
                 log(bold_red(t("Error: ", "Lỗi: ")) + red(f"{type(e).__name__}: {e}"), err=True)
