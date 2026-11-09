@@ -563,7 +563,8 @@ POST_RE = re.compile(
     r"/(?:[^/?#]+/posts/|permalink\.php|story\.php|photo(?:\.php)?/?\?|[^/?#]+/photos/|reel/|"
     r"[^/?#]+/videos/|watch/?\?|share/[prv]/|groups/[^/?#]+/(?:posts|permalink)/|videos/)", re.I)
 RESERVED = {"login", "home.php", "watch", "groups", "events", "marketplace", "reel", "reels", "share",
-            "photo", "photo.php", "story.php", "permalink.php", "media", "pages", "help", "settings"}
+            "photo", "photo.php", "story.php", "permalink.php", "media", "pages", "help", "settings",
+            "profile.php", "people"}   # profile.php / people/ links without an id (profile.php alone is your own profile)
 
 
 class Target:
@@ -771,17 +772,29 @@ def do_login(opts) -> None:
             try:
                 names = {c["name"] for c in ctx.cookies(FB)}
                 url = page.url
-            except Exception:   # window closed by the user
+            except Exception:   # browser closed by the user
                 break
             if {"c_user", "xs"} <= names and "/checkpoint" not in url and "/login" not in url:
                 ok = True
                 break
-            page.wait_for_timeout(1000)
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:   # window closed by the user (a closed page raises here)
+                break
         if ok:
-            page.wait_for_timeout(3000)   # let Facebook finish setting its cookies
+            try:
+                page.wait_for_timeout(3000)   # let Facebook finish setting its cookies
+            except Exception:   # window closed meanwhile: the cookies are still in the context
+                pass
             ctx.storage_state(path=str(SESSION_FILE))
-            uid, name = page_user(page.content())
-        browser.close()
+            try:
+                uid, name = page_user(page.content())
+            except Exception:
+                name = ""
+        try:
+            browser.close()
+        except Exception:
+            pass
     if not ok:
         raise ScrapeError(t("login was not finished (window closed or timed out)",
                             "chưa đăng nhập xong (cửa sổ bị đóng hoặc hết thời gian)"))
@@ -1333,6 +1346,8 @@ class Timeline:
             page.wait_for_timeout(3000)
             html = page.content()
         except Exception as e:
+            if _STOP.is_set():   # Ctrl+C turned into a Playwright error
+                raise
             log(warn(t(f"could not open the stories: {e}", f"không mở được story: {e}")))
             return
         finally:
@@ -1372,14 +1387,25 @@ class Timeline:
                                     lambda n: t(f"Reading the Albums tab · {n} albums", f"Đang đọc tab Album · {n} album"))
             for i, album in enumerate(albums.albums, 1):
                 name = album["title"][:40] or "?"
-                grid = self._read_tab(ctx, album["url"], TabReader("album"), limit,
-                                      lambda n: t(f"Reading album {i}/{len(albums.albums)} \"{name}\" · {n} photos",
-                                                  f"Đang đọc album {i}/{len(albums.albums)} \"{name}\" · {n} ảnh"))
+                try:
+                    grid = self._read_tab(ctx, album["url"], TabReader("album"), limit,
+                                          lambda n: t(f"Reading album {i}/{len(albums.albums)} \"{name}\" · {n} photos",
+                                                      f"Đang đọc album {i}/{len(albums.albums)} \"{name}\" · {n} ảnh"))
+                except ScrapeError:
+                    raise
+                except Exception as e:   # one album that does not load (e.g. a timeout): go on with the next
+                    if _STOP.is_set():
+                        raise
+                    log(warn(t(f'could not read album "{name}": {str(e).splitlines()[0] if str(e) else repr(e)}',
+                               f'không đọc được album "{name}": {str(e).splitlines()[0] if str(e) else repr(e)}')))
+                    continue
                 album["ids"], album["thumbs"] = list(grid.photos), grid.photos
                 self.albums.append(album)
         except ScrapeError:
             raise
         except Exception as e:   # keep what was read so far
+            if _STOP.is_set():   # Ctrl+C turned into a Playwright error
+                raise
             log(warn(t(f"could not read the Photos / Albums tabs: {e}", f"không đọc được tab Ảnh / Album: {e}")))
 
     def _read_tab(self, ctx, url: str, reader: "TabReader", limit: Optional[int],
@@ -1429,6 +1455,8 @@ class Timeline:
         idle, last = 0, -1
         started = time.monotonic()
         while True:
+            if _STOP.is_set():   # Ctrl+C that Playwright or a response handler swallowed
+                raise KeyboardInterrupt
             try:
                 page.keyboard.press("Escape")   # closes the "log in to see more" popup when logged out
                 page.mouse.wheel(0, 2500)
@@ -1544,7 +1572,8 @@ class PhotoViewer:
                     return r.text
             except requests.RequestException:
                 pass
-            time.sleep(2 + 3 * attempt)
+            if attempt < 2:   # no pointless wait after the last try
+                time.sleep(2 + 3 * attempt)
         return ""
 
     def photo(self, fbid: str, set_id: str = "") -> dict:
@@ -1917,7 +1946,8 @@ def owner_vanity(header: dict) -> Optional[str]:
     if isinstance(name, str) and name:
         return name
     parts = [x for x in urlparse(header.get("url") or "").path.split("/") if x]
-    return parts[0] if parts and parts[0] != "profile.php" else None
+    # /profile.php?id=... and /people/<name>/<id>/ links have no username.
+    return parts[0] if parts and parts[0] not in ("profile.php", "people") else None
 
 
 def save_profile(header: dict, html: str, out_dir: Path, session: requests.Session, owner_id: Optional[str],
@@ -1977,7 +2007,7 @@ def folder_name(target: Target, header: dict, owner_id: Optional[str], posts: li
         return sanitize(owner_vanity(header) or "", 80) or target.slug or owner_id or "profile"
     for p in posts:   # a single post: use its author
         parts = [x for x in urlparse(p.get("author_url") or "").path.split("/") if x]
-        if parts and parts[0] != "profile.php":
+        if parts and parts[0] not in ("profile.php", "people") and sanitize(parts[0], 80):
             return sanitize(parts[0], 80)
         if p.get("author_id"):
             return str(p["author_id"])
@@ -3018,6 +3048,11 @@ def main() -> None:
                              "Đã dừng. Chạy lại đúng lệnh cũ để tải tiếp.")), err=True)
         sys.stdout.flush()
         os._exit(130)   # do not wait for downloads still running in other threads
+    except Exception as e:   # e.g. a browser / network error during --login or --check-login
+        status("")
+        log(bold_red(t("Error: ", "Lỗi: ")) + red(f"{type(e).__name__}: {(str(e).strip().splitlines() or [''])[0]}"),
+            err=True)
+        sys.exit(1)
     sys.exit(1 if failed else 0)
 
 
